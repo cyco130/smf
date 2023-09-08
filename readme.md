@@ -203,3 +203,147 @@ This exact "the app as middleware" trick is used by many Vite-based metaframewor
 Some other metaframeworks (most notably [Nuxt](https://nuxt.com)) use [`vite-node`](https://github.com/vitest-dev/vitest/tree/main/packages/vite-node) which is currently part of the Vitest project but it is expected to be [merged into Vite core](https://github.com/vitejs/vite/pull/12165) in the future. It is more difficult to set up but it has additional features like customizable HMR behavior and the ability to run Vite's server and the app code in separate VM contexts or processes. Nevertheless, we will stick with our simpler approach that has been proven to be more than adequate by so many successful metaframeworks.
 
 > ✅ Checkpoint: You can find the progress so far in the `chapter-02` tag.
+
+## 03. API routes
+
+> This may come as a surprise that we're implementing API routes before page routes but API routes are a more fundamental concept if you think about it. A page route is just a special kind of API route that returns HTML.
+
+At this point, we have a pretty neat setup for running server code with Vite. The default export of `src/entry-handler.ts` is simply a Node HTTP request listener that all Node HTTP frameworks are ultimately based on: In Express, the `app` itself is a request listener; in Koa, you can get one with `app.callback()`; in Fastify, you can use `(req, res) => fastify.server.emit("request", req, res)` to create one once the server is ready; and so on. So we are in a position to use any popular Node HTTP framework we want. But we won't, because "from scratch" means "from scratch" 😅.
+
+We'll start by implementing a simple router. The router will map paths to API modules. API modules will export a set of functions named after HTTP methods and they will be called when a request with the corresponding method is received. The signature will be `method(ctx: RequestContext): void | Promise<void>` where `RequestContext` is a simple object with `req`, `res`, and `params` properties. `params` will hold dynamic path parameters.
+
+Most Node server frameworks use a builder pattern for the router. You create a router and you add routes to it in an imperative manner. We'll use a simpler declarative router instead. Building an imperative one on top of it is trivial if we need it later. Most Node server frameworks use a variation of the `/path/to/:param/*rest` syntax for route patterns. We'll use a slightly modified one because we want to support file system routing later but `:` and `*` are hard to use in file names on Linux and Mac, and flat-out forbidden on Windows. I'll go with a loosely [Remix](https://remix.run/docs/en/main/file-conventions/route-files-v2#route-file-naming-v2)-inspired `/path/to/$param/$$rest` syntax. The usage will look something like this:
+
+```ts
+export default buildHandler({
+  "/foo": () => import("./routes/foo"),
+  "/bar": () => import("./routes/bar"),
+  "/baz/$id": () => import("./routes/baz"),
+  "/qux/$$rest": () => import("./routes/qux"),
+});
+```
+
+There are some neat TypeScript tricks to infer the type of `params` object from the route pattern but we won't go into that here. Also, for simplicity, we will use a linear regexp search. I didn't test the following thoroughly but it seemed to work with a few cases I tried it with. Our MF is called SMF, so good enough for Rock'n'Roll 🤘.
+
+This will be part of SMF's server runtime so we'll put it in `smf/server.ts`:
+
+`smf/server.ts`
+
+```ts
+import type { IncomingMessage, RequestListener, ServerResponse } from "http";
+
+export type RequestHandler<P = Record<string, string>> = (
+  ctx: RequestContext<P>,
+) => void | Promise<void>;
+
+export interface RequestContext<P = Record<string, string>> {
+  req: IncomingMessage;
+  res: ServerResponse;
+  params: P;
+}
+
+export interface ApiModule<P = Record<string, string>> {
+  get?: RequestHandler<P>;
+  post?: RequestHandler<P>;
+  put?: RequestHandler<P>;
+  delete?: RequestHandler<P>;
+  patch?: RequestHandler<P>;
+  options?: RequestHandler<P>;
+  head?: RequestHandler<P>;
+  all?: RequestHandler<P>; // Fallback for all methods
+}
+
+export function buildHandler(
+  apiRoutes: Record<string, () => Promise<ApiModule>>,
+): RequestListener {
+  // Convert into an array of [RegExp, () => Promise<ApiModule>] tuples
+  const routes = Object.entries(apiRoutes).map(
+    ([path, importer]) => [patternToRegExp(path), importer] as const,
+  );
+
+  return async function handler(req, res) {
+    // These are typed as optional for some reason
+    const { url = "/", method = "GET" } = req;
+
+    // Remove query string and hash
+    const path = url.match(/^[^?#]*/)![0];
+    const match = routes.find(([pattern]) => pattern.exec(path));
+
+    if (!match) {
+      res.statusCode = 404;
+      res.end("Not found");
+      return;
+    }
+
+    const importer = match[1];
+    try {
+      const module = await importer();
+      const handler =
+        module[method.toLowerCase() as keyof ApiModule] ?? module.all;
+
+      if (!handler) {
+        // Look ma, I'm HTTP-ly correct!
+        res.statusCode = 405;
+        res.end("Method not allowed");
+        return;
+      }
+
+      const params = match[0].exec(path)?.groups ?? {};
+      await handler({ req, res, params });
+    } catch (error) {
+      console.error(error);
+      res.statusCode = 500;
+      res.end("Internal server error");
+    }
+  };
+}
+
+function patternToRegExp(path: string) {
+  return RegExp(
+    "^" +
+      path
+        .replace(/[\\^*+?.()|[\]{}]/g, (x) => `\\${x}`) // Escape special characters except $
+        .replace(/\$\$(\w+)$/, "(?<$1>.*)") // $$rest to named capture group
+        .replace(/\$(\w+)(\?)?(\.)?/g, "$2(?<$1>[^/]+)$2$3"), // $param to named capture groups
+  );
+}
+```
+
+Now let's create a couple of API route modules in `src/routes`. I will use the `.api.ts` convention for API routes, it will come in handy when we implement file system routing later. I prefer an explicit naming convention to exposing every file in a directory as a route.
+
+`src/routes/foo.api.ts`
+
+```ts
+import type { RequestHandler } from "../../smf/server";
+
+export const get: RequestHandler = ({ res }) => {
+  res.end("Hello from foo!");
+};
+```
+
+`src/routes/bar.api.ts`
+
+```ts
+import type { RequestHandler } from "../../smf/server";
+
+export const get: RequestHandler = ({ res }) => {
+  res.end("Hello from bar!");
+};
+```
+
+Finally, let's update `src/entry-handler.ts` to use our new router:
+
+`src/entry-handler.ts`
+
+```ts
+import { buildHandler } from "../smf/server";
+
+export default buildHandler({
+  "/foo": () => import("./routes/foo.api"),
+  "/bar": () => import("./routes/bar.api"),
+});
+```
+
+If you run `pnpm dev` now, you will get a 404 for `/` because we don't have a handler for it yet. But `/foo` and `/bar` should work as expected. So here we go, we have API routes.
+
+> ✅ Checkpoint: You can find the progress so far in the `chapter-03` tag.
