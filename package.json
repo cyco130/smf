@@ -1,0 +1,18 @@
+{
+  "name": "smf",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite"
+  },
+  "dependencies": {
+    "preact": "^10.17.1",
+    "preact-render-to-string": "^6.2.1"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.5.0",
+    "@types/node": "^20.5.9",
+    "prettier": "^3.0.3",
+    "vite": "^4.4.9"
+  }
+}
