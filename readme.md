@@ -304,7 +304,8 @@ function patternToRegExp(path: string) {
       path
         .replace(/[\\^*+?.()|[\]{}]/g, (x) => `\\${x}`) // Escape special characters except $
         .replace(/\$\$(\w+)$/, "(?<$1>.*)") // $$rest to named capture group
-        .replace(/\$(\w+)(\?)?(\.)?/g, "$2(?<$1>[^/]+)$2$3"), // $param to named capture groups
+        .replace(/\$(\w+)(\?)?(\.)?/g, "$2(?<$1>[^/]+)$2$3") + // $param to named capture groups
+      "/?$", // Optional trailing slash and end of string
   );
 }
 ```
@@ -347,3 +348,138 @@ export default buildHandler({
 If you run `pnpm dev` now, you will get a 404 for `/` because we don't have a handler for it yet. But `/foo` and `/bar` should work as expected. So here we go, we have API routes.
 
 > ✅ Checkpoint: You can find the progress so far in the `chapter-03` tag.
+
+## 04. File system routing
+
+Developers have a love-hate relationship with file system routing. It's simple and intuitive at first but file names make a poor configuration language. As more and more features are added, you risk ending up with monstrosities like `/foo/bar/@top-bar/(..)(..)[...slug].tsx`. Nevertheless, file system routing is one of the staples of metaframework design. So we'll implement it too but we'll take a hybrid approach: It will be strictly optional and the user will be able to modify automatically generated routes as they see fit.
+
+Vite has a [`import.meta.glob`](https://vitejs.dev/guide/features.html#glob-import) feature that allows us to implement file system routing with very little effort. The docs say:
+
+> ```js
+> const modules = import.meta.glob("./dir/*.js");
+> ```
+>
+> The above will be transformed into the following:
+>
+> ```js
+> // code produced by vite
+> const modules = {
+>   "./dir/foo.js": () => import("./dir/foo.js"),
+>   "./dir/bar.js": () => import("./dir/bar.js"),
+> };
+> ```
+
+This is the exact format our router expects. What a coincidence! 😄
+
+First, we'll add the following to `tsconfig.json` to have Vite-specific types (like the types for `import.meta.glob`) available in our code:
+
+```
+    "jsxImportSource": "preact",
++   "types": ["vite/client"]
+  }
+}
+```
+
+Now we can add `const apiRoutes = import.meta.glob("./routes/**/*.api.ts");` to `src/entry-handler.ts`. According to the docs, the outcome will be the same as if we had written:
+
+```ts
+const apiRoutes = {
+  "./routes/foo.api.ts": () => import("./routes/foo.api.ts"),
+  "./routes/bar.api.ts": () => import("./routes/bar.api.ts"),
+};
+```
+
+As far as I can remember Vite takes care of normalizing path separators to forward slashes on Windows. So all we need to do is trim the `./routes` prefix and the `.api.ts` suffix to convert the file names into route patterns. We will also trim `/index` from the end of the route patterns to make `/foo.api.ts` and `/foo/index.api.ts` equivalent (we need it at least for the root route!). We'll implement this in a `prepareApiRoutes` function that we'll add to the bottom of `smf/server.ts`. The types are lenient because `import.meta.glob` is not strongly typed anyway:
+
+`smf/server.ts`
+
+```ts
+export function prepareApiRoutes(
+  apiRoutes: Record<string, () => Promise<any>>,
+): Record<string, () => Promise<ApiModule>> {
+  return Object.fromEntries(
+    Object.entries(apiRoutes).map(([path, importer]) => {
+      // This is a bit fragile as it doesn't allow different file extensions
+      // but again, good enough for Rock'n'Roll.
+      let pattern = path.slice("./routes".length, -".api.ts".length);
+      if (pattern.endsWith("/index")) {
+        pattern = pattern.slice(0, -"/index".length);
+      }
+
+      return [pattern, importer];
+    }),
+  );
+}
+```
+
+We will also need to sort the routes so that more specific routes come first. When the user was adding routes manually, we could dump this responsibility on them like Express does but since the order of the routes is not under the user's control anymore, we'll have to do it ourselves. Unfortunately, there are no universally applicable rules here: Should `/foo/bar` match `/foo/$param` or `/$param/bar` first? I'm inclined to say the former but it's more of an opinion than a fact. However, I'm sure everyone will agree that `/foo/$a-$b/bar` should come before `/foo/$a/bar`. I'll adapt a simplified version of the sorting rules used by Rakkas. Feel free to disagree and modify it to your liking:
+
+```ts
+function compareRoutePatterns(a: string, b: string): number {
+  // Non-catch-all routes first: /foo before /$$rest
+  const catchAll =
+    Number(a.match(/\$\$(\w+)$/)) - Number(b.match(/\$\$(\w+)$/));
+  if (catchAll) return catchAll;
+
+  // Split into segments
+  const aSegments = a.split("/");
+  const bSegments = b.split("/");
+
+  // Routes with fewer dynamic segments first: /foo/bar before /foo/$bar
+  const dynamicSegments =
+    aSegments.filter((segment) => segment.includes("$")).length -
+    bSegments.filter((segment) => segment.includes("$")).length;
+  if (dynamicSegments) return dynamicSegments;
+
+  // Routes with fewer segments first: /foo/bar before /foo/bar
+  const segments = aSegments.length - bSegments.length;
+  if (segments) return segments;
+
+  // Routes with earlier dynamic segments first: /foo/$bar before /$foo/bar
+  for (let i = 0; i < aSegments.length; i++) {
+    const aSegment = aSegments[i];
+    const bSegment = bSegments[i];
+    const dynamic =
+      Number(aSegment.includes("$")) - Number(bSegment.includes("$"));
+    if (dynamic) return dynamic;
+
+    // Routes with more dynamic subsegments at this position first: /foo/$a-$b before /foo/$a
+    const subsegments = aSegment.split("$").length - bSegment.split("$").length;
+    if (subsegments) return subsegments;
+  }
+
+  // Equal as far as we can tell
+  return 0;
+}
+```
+
+Then we'll have to update the first few lines of `buildHandler` to use our comparison function:
+
+```ts
+export function buildHandler(
+	apiRoutes: Record<string, () => Promise<ApiModule>>,
+): RequestListener {
+  // Convert into an array of [RegExp, () => Promise<ApiModule>] tuples
+  const routes = Object.keys(apiRoutes)
+    .sort(compareRoutePatterns)
+    .map((pattern) => [patternToRegExp(pattern), apiRoutes[pattern]] as const);
+  // ...
+```
+
+Now we can use `prepareApiRoutes` in `src/entry-handler.ts`:
+
+`src/entry-handler.ts`
+
+```ts
+import { buildHandler, prepareApiRoutes } from "../smf/server";
+
+const apiRoutes = import.meta.glob("./routes/**/*.api.ts");
+
+export default buildHandler(prepareApiRoutes(apiRoutes));
+```
+
+If you run `pnpm dev` now, you will see that `/foo` and `/bar` still work. If you delete or rename one of them, it will be reflected in the app. That's it, we have file system routing! The user can change the contents of the `apiRoutes` object before passing it to `buildHandler` or simply not use it at all and define their own routes. Best of both worlds.
+
+Although `import.meta.glob` is pretty flexible, some Vite-based metaframeworks use a custom file system routing solution. Rakkas, for example, generates a set of virtual modules for extra flexibility. SvelteKit follows a similar approach. But some do use `import.meta.glob` and it's a perfectly good solution for most use cases.
+
+> ✅ Checkpoint: You can find the progress so far in the `chapter-04` tag.

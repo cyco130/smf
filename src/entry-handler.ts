@@ -1,6 +1,5 @@
-import { buildHandler } from "../smf/server";
+import { buildHandler, prepareApiRoutes } from "../smf/server";
 
-export default buildHandler({
-	"/foo": () => import("./routes/foo.api"),
-	"/bar": () => import("./routes/bar.api"),
-});
+const apiRoutes = import.meta.glob("./routes/**/*.api.ts");
+
+export default buildHandler(prepareApiRoutes(apiRoutes));
