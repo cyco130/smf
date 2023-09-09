@@ -702,3 +702,226 @@ export default function HomePage() {
 That was a lot of code but most of it was just boilerplate. If you run `pnpm dev` now, you will finally see our first page rendered at `localhost:5173/`. We're not sending any client-side JavaScript yet and we don't have a way to pass data to our pages but our router now supports both pages and API routes. Pretty cool, no?
 
 > ✅ Checkpoint: You can find the progress so far in the `chapter-05` tag.
+
+## 06. Hydration
+
+We have a working SSR setup now but we need to send some client-side JavaScript and hydrate our page to make it interactive. First, let's update our home page to add interactivity:
+
+`src/routes/index.page.tsx`
+
+```tsx
+import { useState } from "preact/hooks";
+
+export default function HomePage() {
+  const [count, setCount] = useState(0);
+
+  return (
+    <div>
+      <h1>Hello, world!</h1>
+      <p>Count: {count}</p>
+      <button onClick={() => setCount((c) => c + 1)}>Increment</button>
+    </div>
+  );
+}
+```
+
+When you run `pnpm dev` now, you will see that the page is not interactive. Let's make it interactive by first adding a script tag to `src/Document.tsx`:
+
+`src/Document.tsx`
+
+```
+        <div id="app">{props.children}</div>
++       <script type="module" src="/src/entry-client.tsx" />
+      </body>
+```
+
+Then we'll need to create `src/entry-client.tsx` that we just referenced:
+
+`src/entry-client.ts`
+
+```ts
+alert("Hello from entry-client.tsx!");
+```
+
+If you run `pnpm dev` now, you will see the alert. Yay, our first few bytes of client-side JavaScript! We're web developers so obviously we will keep adding more until our bundle size exceeds the mass of the observable universe. But we'll get there in small increments.
+
+Since we have only one page, we know exactly what's going to be rendered on the client. Let's start with a simple hard-coded version. Note that we're not hydrating the whole `Document` component, but just `App`:
+
+`src/entry-client.tsx`
+
+```tsx
+import { hydrate } from "preact";
+import { App } from "./App";
+import HomePage from "./routes/index.page";
+
+hydrate(
+  <App>
+    <HomePage />
+  </App>,
+  document.getElementById("app")!,
+);
+```
+
+If you run `pnpm dev` now, you will see that the page is now interactive!
+
+Let's tackle HMR next. We'll just update our `Document` component to inject Vite's client script:
+
+`src/Document.tsx`
+
+```
+        <title>My SMF App</title>
++       <script type="module" src="@vite/client" />
+      </head>
+```
+
+That's it! Refresh the page one last time and now Vite's client script and the Preact plugin will take care of the rest. Now you can update the `index.page.tsx` file and the changes will be reflected without a full page reload. You can even click on the "Increment" button a few times and the counter will keep its state between refreshes. This comes in extremely handy when developing complex UIs.
+
+Let's fix the hard-coded routing next. Since page routes need to be shared between the server and the client, we'll move them to `src/page-routes.ts` page first:
+
+`src/page-routes.ts`
+
+```ts
+import { preparePageRoutes } from "../smf/server";
+
+export const pageRoutes = preparePageRoutes(
+  import.meta.glob("./routes/**/*.page.tsx"),
+);
+```
+
+Our handler entry will now become:
+
+`src/entry-handler.ts`
+
+```ts
+import { buildHandler, prepareApiRoutes } from "../smf/server";
+import { Document } from "./Document";
+import { App } from "./App";
+import { pageRoutes } from "./page-routes";
+
+const apiRoutes = prepareApiRoutes(import.meta.glob("./routes/**/*.api.ts"));
+
+export default buildHandler({
+  apiRoutes,
+  pageRoutes,
+  Document,
+  App,
+});
+```
+
+Then we'll start creating SMF's client runtime. But we should move the bits that will be shared between the client and the server into a `smf/shared.ts` file first:
+
+`smf/shared.ts`
+
+```ts
+import type { ComponentType, ComponentChildren } from "preact";
+
+export interface PageModule {
+  // ...
+}
+
+export interface AppProps {
+  // ...
+}
+
+export function patternToRegExp(path: string) {
+  // ...
+}
+
+export function compareRoutePatterns(a: string, b: string): number {
+  // ...
+}
+```
+
+We will of course delete them from `smf/server.tsx` and import from `smf/shared.ts` instead.
+
+Now we're good to go with `smf/client.tsx`:
+
+`smf/client.tsx`
+
+```tsx
+import { hydrate, type ComponentType } from "preact";
+import {
+  patternToRegExp,
+  compareRoutePatterns,
+  type PageModule,
+  type AppProps,
+} from "./shared";
+
+export interface ClientOptions {
+  App: ComponentType<AppProps>;
+  pageRoutes: Record<string, () => Promise<PageModule>>;
+}
+
+export async function startClient(options: ClientOptions) {
+  const { App, pageRoutes } = options;
+  const routes = Object.keys(pageRoutes)
+    .sort(compareRoutePatterns)
+    .map((pattern) => [patternToRegExp(pattern), pageRoutes[pattern]] as const);
+
+  console.log(routes);
+
+  const path = location.pathname;
+  const match = routes.find(([pattern]) => pattern.exec(path));
+
+  if (!match) {
+    throw new Error(`No route found for ${path}`);
+  }
+
+  const importer = match[1];
+  const module = await importer();
+
+  const Page = module.default;
+
+  hydrate(
+    <App>
+      <Page />
+    </App>,
+    document.getElementById("app")!,
+  );
+}
+```
+
+And now our `src/entry-client.tsx` will become simply:
+
+`src/entry-client.tsx`
+
+```tsx
+import { startClient } from "../smf/client";
+import { App } from "./App";
+import { pageRoutes } from "./page-routes";
+
+startClient({ App, pageRoutes }).catch((error) => {
+  console.error(error);
+});
+```
+
+We'll add another page route and a navigation menu to test our client-side routing:
+
+`src/routes/about.page.tsx`
+
+```tsx
+export default function AboutPage() {
+  return <h1>About</h1>;
+}
+```
+
+`src/App.tsx`
+
+```tsx
+import type { AppProps } from "../smf/shared";
+
+export function App(props: AppProps) {
+  return (
+    <div>
+      <nav>
+        <a href="/">Home</a> | <a href="/about">About</a>
+      </nav>
+      <main>{props.children}</main>
+    </div>
+  );
+}
+```
+
+If everything goes well, you should be able to navigate between the two pages now! We have now something approaching a real metaframework. It could even be called useful if we had a way to pass data to our pages.
+
+> ✅ Checkpoint: You can find the progress so far in the `chapter-06` tag.

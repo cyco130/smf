@@ -1,6 +1,12 @@
 import type { IncomingMessage, RequestListener, ServerResponse } from "http";
 import { type ComponentType, type ComponentChildren } from "preact";
 import { render } from "preact-render-to-string";
+import {
+	AppProps,
+	PageModule,
+	compareRoutePatterns,
+	patternToRegExp,
+} from "./shared";
 
 export type RequestHandler<P = Record<string, string>> = (
 	ctx: RequestContext<P>,
@@ -23,10 +29,6 @@ export interface ApiModule<P = Record<string, string>> {
 	all?: RequestHandler<P>; // Fallback for all methods
 }
 
-export interface PageModule {
-	default: ComponentType;
-}
-
 export interface HandlerOptions {
 	apiRoutes: Record<string, () => Promise<ApiModule>>;
 	pageRoutes: Record<string, () => Promise<PageModule>>;
@@ -36,10 +38,6 @@ export interface HandlerOptions {
 
 export interface DocumentProps {
 	children?: ComponentChildren;
-}
-
-export interface AppProps {
-	children: ComponentChildren;
 }
 
 export function buildHandler(options: HandlerOptions): RequestListener {
@@ -64,6 +62,8 @@ export function buildHandler(options: HandlerOptions): RequestListener {
 	return async function handler(req, res) {
 		// These are typed as optional for some reason
 		const { url = "/", method = "GET" } = req;
+
+		console.log(`${method} ${url}`);
 
 		// Remove query string and hash
 		const path = url.match(/^[^?#]*/)![0];
@@ -127,17 +127,6 @@ function renderPage(
 	return "<!DOCTYPE html>" + document;
 }
 
-function patternToRegExp(path: string) {
-	return RegExp(
-		"^" +
-			path
-				.replace(/[\\^*+?.()|[\]{}]/g, (x) => `\\${x}`) // Escape special characters except $
-				.replace(/\$\$(\w+)$/, "(?<$1>.*)") // $$rest to named capture group
-				.replace(/\$(\w+)(\?)?(\.)?/g, "$2(?<$1>[^/]+)$2$3") + // $param to named capture groups
-			"/?$", // Optional trailing slash and end of string
-	);
-}
-
 export function prepareApiRoutes(
 	apiRoutes: Record<string, () => Promise<any>>,
 ): Record<string, () => Promise<ApiModule>> {
@@ -168,41 +157,4 @@ export function preparePageRoutes(
 			return [pattern, importer];
 		}),
 	);
-}
-
-function compareRoutePatterns(a: string, b: string): number {
-	// Non-catch-all routes first: /foo before /$$rest
-	const catchAll =
-		Number(a.match(/\$\$(\w+)$/)) - Number(b.match(/\$\$(\w+)$/));
-	if (catchAll) return catchAll;
-
-	// Split into segments
-	const aSegments = a.split("/");
-	const bSegments = b.split("/");
-
-	// Routes with fewer dynamic segments first: /foo/bar before /foo/$bar
-	const dynamicSegments =
-		aSegments.filter((segment) => segment.includes("$")).length -
-		bSegments.filter((segment) => segment.includes("$")).length;
-	if (dynamicSegments) return dynamicSegments;
-
-	// Routes with fewer segments first: /foo/bar before /foo/bar
-	const segments = aSegments.length - bSegments.length;
-	if (segments) return segments;
-
-	// Routes with earlier dynamic segments first: /foo/$bar before /$foo/bar
-	for (let i = 0; i < aSegments.length; i++) {
-		const aSegment = aSegments[i];
-		const bSegment = bSegments[i];
-		const dynamic =
-			Number(aSegment.includes("$")) - Number(bSegment.includes("$"));
-		if (dynamic) return dynamic;
-
-		// Routes with more dynamic subsegments at this position first: /foo/$a-$b before /foo/$a
-		const subsegments = aSegment.split("$").length - bSegment.split("$").length;
-		if (subsegments) return subsegments;
-	}
-
-	// Equal as far as we can tell
-	return 0;
 }
