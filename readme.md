@@ -457,7 +457,7 @@ Then we'll have to update the first few lines of `buildHandler` to use our compa
 
 ```ts
 export function buildHandler(
-	apiRoutes: Record<string, () => Promise<ApiModule>>,
+  apiRoutes: Record<string, () => Promise<ApiModule>>,
 ): RequestListener {
   // Convert into an array of [RegExp, () => Promise<ApiModule>] tuples
   const routes = Object.keys(apiRoutes)
@@ -483,3 +483,222 @@ If you run `pnpm dev` now, you will see that `/foo` and `/bar` still work. If yo
 Although `import.meta.glob` is pretty flexible, some Vite-based metaframeworks use a custom file system routing solution. Rakkas, for example, generates a set of virtual modules for extra flexibility. SvelteKit follows a similar approach. But some do use `import.meta.glob` and it's a perfectly good solution for most use cases.
 
 > ✅ Checkpoint: You can find the progress so far in the `chapter-04` tag.
+
+## 05. Page routes
+
+Finally, without further ado, we'll implement page routes. We'll use the `.page.tsx` convention for page route modules and each page route module will default export a Preact component. We'll modify our `buildHandler` function to accept a `{ apiRoutes, pageRoutes, Document, App }` object instead of just `apiRoutes`. `Document` and `App` will be Preact components to render the HTML document and the layout around the page content respectively. The difference between `Document` and `App` is that `Document` will only render static HTML while `App` can be interactive.
+
+Let's rename `smf/server.ts` to `smf/server.tsx` for starters so that we can use JSX in it. Then we'll add the following:
+
+`smf/server.tsx`
+
+```tsx
+// Somewhere near the top
+import { type ComponentType, type ComponentChildren } from "preact";
+import { render } from "preact-render-to-string";
+
+// Just before `buildHandler`
+export interface PageModule {
+  default: ComponentType;
+}
+
+export interface HandlerOptions {
+  apiRoutes: Record<string, () => Promise<ApiModule>>;
+  pageRoutes: Record<string, () => Promise<PageModule>>;
+  Document: ComponentType<DocumentProps>;
+  App: ComponentType<AppProps>;
+}
+
+export interface DocumentProps {
+  children?: ComponentChildren;
+}
+
+export interface AppProps {
+  children: ComponentChildren;
+}
+```
+
+Then we'll update `buildHandler` and add a `renderPage` helper function right after it:
+
+`smf/server.tsx`
+
+```tsx
+export function buildHandler(options: HandlerOptions): RequestListener {
+  const pageRoutes = Object.keys(options.pageRoutes)
+    .sort(compareRoutePatterns)
+    .map(
+      (pattern) =>
+        [
+          patternToRegExp(pattern),
+          options.pageRoutes[pattern],
+          "page",
+        ] as const,
+    );
+
+  const apiRoutes = Object.keys(options.apiRoutes)
+    .sort(compareRoutePatterns)
+    .map(
+      (pattern) =>
+        [patternToRegExp(pattern), options.apiRoutes[pattern], "api"] as const,
+    );
+
+  return async function handler(req, res) {
+    // These are typed as optional for some reason
+    const { url = "/", method = "GET" } = req;
+
+    // Remove query string and hash
+    const path = url.match(/^[^?#]*/)![0];
+    // Page routes before API routes
+    const match =
+      pageRoutes.find(([pattern]) => pattern.exec(path)) ??
+      apiRoutes.find(([pattern]) => pattern.exec(path));
+
+    if (!match) {
+      res.statusCode = 404;
+      res.end("Not found");
+      return;
+    }
+
+    try {
+      // Page or API?
+      if (match[2] === "page") {
+        const importer = match[1];
+        const module = await importer();
+        const html = renderPage(module.default, options.Document, options.App);
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.end(html);
+        return;
+      }
+
+      const importer = match[1];
+      const module = await importer();
+      const handler =
+        module[method.toLowerCase() as keyof ApiModule] ?? module.all;
+
+      if (!handler) {
+        // Look ma, I'm HTTP-ly correct!
+        res.statusCode = 405;
+        res.end("Method not allowed");
+        return;
+      }
+
+      const params = match[0].exec(path)?.groups ?? {};
+      await handler({ req, res, params });
+    } catch (error) {
+      console.error(error);
+      res.statusCode = 500;
+      res.end("Internal server error");
+    }
+  };
+}
+
+function renderPage(
+  Page: ComponentType,
+  Document: ComponentType<DocumentProps>,
+  App: ComponentType<AppProps>,
+) {
+  const document = render(
+    <Document>
+      <App>
+        <Page />
+      </App>
+    </Document>,
+  );
+  return "<!DOCTYPE html>" + document;
+}
+```
+
+We'll also need a `preparePageRoutes` function, the page route equivalent of `prepareApiRoutes`:
+
+`smf/server.tsx`
+
+```ts
+export function preparePageRoutes(
+  pageRoutes: Record<string, () => Promise<any>>,
+): Record<string, () => Promise<PageModule>> {
+  return Object.fromEntries(
+    Object.entries(pageRoutes).map(([path, importer]) => {
+      let pattern = path.slice("./routes".length, -".page.tsx".length);
+      if (pattern.endsWith("/index")) {
+        pattern = pattern.slice(0, -"/index".length);
+      }
+
+      return [pattern, importer];
+    }),
+  );
+}
+```
+
+Then our `src/App.tsx` and `src/Document.tsx` will look like this:
+
+`src/App.tsx`
+
+```tsx
+import { AppProps } from "../smf/server";
+
+export function App(props: AppProps) {
+  return <div>{props.children}</div>;
+}
+```
+
+`src/Document.tsx`
+
+```tsx
+import { DocumentProps } from "../smf/server";
+
+export function Document(props: DocumentProps) {
+  return (
+    <html>
+      <head>
+        <meta charSet="utf-8" />
+        <meta name="viewport" content="width=device-width" />
+        <title>My SMF App</title>
+      </head>
+      <body>
+        <div id="app">{props.children}</div>
+      </body>
+    </html>
+  );
+}
+```
+
+Then we'll update `src/entry-handler.ts` to use our new `buildHandler`:
+
+`src/entry-handler.ts`
+
+```ts
+import {
+  buildHandler,
+  prepareApiRoutes,
+  preparePageRoutes,
+} from "../smf/server";
+import { Document } from "./Document";
+import { App } from "./App";
+
+const apiRoutes = prepareApiRoutes(import.meta.glob("./routes/**/*.api.ts"));
+const pageRoutes = preparePageRoutes(
+  import.meta.glob("./routes/**/*.page.tsx"),
+);
+
+export default buildHandler({
+  apiRoutes,
+  pageRoutes,
+  Document,
+  App,
+});
+```
+
+Finally, we'll create our first page route:
+
+`src/routes/index.page.tsx`
+
+```tsx
+export default function HomePage() {
+  return <h1>Hello, world!</h1>;
+}
+```
+
+That was a lot of code but most of it was just boilerplate. If you run `pnpm dev` now, you will finally see our first page rendered at `localhost:5173/`. We're not sending any client-side JavaScript yet and we don't have a way to pass data to our pages but our router now supports both pages and API routes. Pretty cool, no?
+
+> ✅ Checkpoint: You can find the progress so far in the `chapter-05` tag.

@@ -1,5 +1,19 @@
-import { buildHandler, prepareApiRoutes } from "../smf/server";
+import {
+	buildHandler,
+	prepareApiRoutes,
+	preparePageRoutes,
+} from "../smf/server";
+import { Document } from "./Document";
+import { App } from "./App";
 
-const apiRoutes = import.meta.glob("./routes/**/*.api.ts");
+const apiRoutes = prepareApiRoutes(import.meta.glob("./routes/**/*.api.ts"));
+const pageRoutes = preparePageRoutes(
+	import.meta.glob("./routes/**/*.page.tsx"),
+);
 
-export default buildHandler(prepareApiRoutes(apiRoutes));
+export default buildHandler({
+	apiRoutes,
+	pageRoutes,
+	Document,
+	App,
+});
